@@ -24,7 +24,7 @@
 #include "core.h"
 #include "utils.h"
 #include "hif/pcie/dev.h"
-#include "hif/pcie/rx_ndp.h"
+#include "hif/pcie/8964/rx_ndp.h"
 
 #define MAX_NUM_RX_RING_BYTES   (MAX_NUM_RX_DESC * \
 				sizeof(struct pcie_rx_desc_ndp))
@@ -86,11 +86,11 @@ static int pcie_rx_ring_init_ndp(struct mwl_priv *priv)
 			}
 			skb_reserve(psk_buff, MIN_BYTES_RX_HEADROOM);
 
-			dma = pci_map_single(pcie_priv->pdev,
+			dma = dma_map_single(&(pcie_priv->pdev)->dev,
 					     psk_buff->data,
 					     desc->rx_buf_size,
-					     PCI_DMA_FROMDEVICE);
-			if (pci_dma_mapping_error(pcie_priv->pdev, dma)) {
+					     DMA_FROM_DEVICE);
+			if (dma_mapping_error(&(pcie_priv->pdev)->dev, dma)) {
 				wiphy_err(priv->hw->wiphy,
 					  "failed to map pci memory!\n");
 				return -ENOMEM;
@@ -120,11 +120,11 @@ static void pcie_rx_ring_cleanup_ndp(struct mwl_priv *priv)
 	if (desc->prx_ring) {
 		for (i = 0; i < MAX_NUM_RX_DESC; i++) {
 			if (desc->rx_vbuflist[i]) {
-				pci_unmap_single(pcie_priv->pdev,
+				dma_unmap_single(&(pcie_priv->pdev)->dev,
 						 le32_to_cpu(
 						 desc->prx_ring[i].data),
 						 desc->rx_buf_size,
-						 PCI_DMA_FROMDEVICE);
+						 DMA_FROM_DEVICE);
 				desc->rx_vbuflist[i] = NULL;
 			}
 		}
@@ -311,8 +311,8 @@ static inline void pcie_rx_process_fast_data(struct mwl_priv *priv,
 	if (ieee80211_is_data_qos(fc)) {
 		__le16 *qos_control;
 
-		qos_control = (__le16 *)skb_push(skb, 2);
-		memcpy(skb_push(skb, hdrlen - 2), &hdr, hdrlen - 2);
+		qos_control = (__le16 *)skb_push(skb, IEEE80211_QOS_CTL_LEN);
+		memcpy(skb_push(skb, hdrlen - IEEE80211_QOS_CTL_LEN), &hdr, hdrlen - IEEE80211_QOS_CTL_LEN);
 		if (ethertype == ETH_P_PAE)
 			*qos_control = cpu_to_le16(
 				IEEE80211_QOS_CTL_ACK_POLICY_NOACK | 7);
@@ -338,6 +338,7 @@ static inline void pcie_rx_process_slow_data(struct mwl_priv *priv,
 	struct ieee80211_rx_status *status;
 	struct ieee80211_hdr *wh;
 	struct mwl_vif *mwl_vif = NULL;
+	struct sk_buff* monitor_skb;
 
 	pcie_rx_remove_dma_header(skb, 0);
 	status = IEEE80211_SKB_RXCB(skb);
@@ -380,6 +381,16 @@ static inline void pcie_rx_process_slow_data(struct mwl_priv *priv,
 			ieee80211_queue_work(priv->hw, &priv->wds_check_handle);
 			priv->wds_check = true;
 		}
+
+		if (status->flag & RX_FLAG_DECRYPTED) {
+			monitor_skb = skb_copy(skb, GFP_ATOMIC);
+			if (monitor_skb) {
+				IEEE80211_SKB_RXCB(monitor_skb)->flag |= RX_FLAG_ONLY_MONITOR;
+				((struct ieee80211_hdr *)monitor_skb->data)->frame_control &= ~__cpu_to_le16(IEEE80211_FCTL_PROTECTED);
+				ieee80211_rx(priv->hw, monitor_skb);
+			}
+			status->flag |= RX_FLAG_SKIP_MONITOR;
+		}
 	}
 
 	status->flag |= RX_FLAG_DUP_VALIDATED;
@@ -400,11 +411,11 @@ static inline int pcie_rx_refill_ndp(struct mwl_priv *priv, u32 buf_idx)
 		return -ENOMEM;
 	skb_reserve(psk_buff, MIN_BYTES_RX_HEADROOM);
 
-	dma = pci_map_single(pcie_priv->pdev,
+	dma = dma_map_single(&(pcie_priv->pdev)->dev,
 			     psk_buff->data,
 			     desc->rx_buf_size,
-			     PCI_DMA_FROMDEVICE);
-	if (pci_dma_mapping_error(pcie_priv->pdev, dma)) {
+			     DMA_FROM_DEVICE);
+	if (dma_mapping_error(&(pcie_priv->pdev)->dev, dma)) {
 		wiphy_err(priv->hw->wiphy,
 			  "refill: failed to map pci memory!\n");
 		return -ENOMEM;
@@ -509,10 +520,10 @@ recheck:
 			break;
 		}
 
-		pci_unmap_single(pcie_priv->pdev,
+		dma_unmap_single(&(pcie_priv->pdev)->dev,
 				 le32_to_cpu(prx_desc->data),
 				 desc->rx_buf_size,
-				 PCI_DMA_FROMDEVICE);
+				 DMA_FROM_DEVICE);
 
 		bad_mic = false;
 		ctrl = le32_to_cpu(prx_ring_done->ctrl);
@@ -554,12 +565,14 @@ recheck:
 			dev_kfree_skb_any(psk_buff);
 			break;
 		case RXRING_CASE_SLOW_BAD_MIC:
-			bad_mic = true;
 		case RXRING_CASE_SLOW_NOQUEUE:
 		case RXRING_CASE_SLOW_NORUN:
 		case RXRING_CASE_SLOW_MGMT:
 		case RXRING_CASE_SLOW_MCAST:
 		case RXRING_CASE_SLOW_PROMISC:
+			if (RXRING_CASE_SLOW_BAD_MIC == ctrl_case)
+				bad_mic = true;
+
 			rx_info = (struct rx_info *)psk_buff->data;
 			dma_data = (struct pcie_dma_data *)&rx_info->hdr[0];
 			pktlen = le16_to_cpu(dma_data->fwlen);

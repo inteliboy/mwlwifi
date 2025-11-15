@@ -27,7 +27,7 @@
 #include <net/mac80211.h>
 
 #define PCIE_DRV_NAME    KBUILD_MODNAME
-#define PCIE_DRV_VERSION "10.3.8.0-20181210"
+#define PCIE_DRV_VERSION "10.4.11.0"
 
 #define PCIE_MIN_BYTES_HEADROOM   64
 #define PCIE_MIN_TX_HEADROOM_KF2  96
@@ -36,9 +36,8 @@
 #define PCIE_MAX_NUM_TX_DESC      256
 #define PCIE_TX_QUEUE_LIMIT       (3 * PCIE_MAX_NUM_TX_DESC)
 #define PCIE_TX_WAKE_Q_THRESHOLD  (2 * PCIE_MAX_NUM_TX_DESC)
-#define PCIE_DELAY_FREE_Q_LIMIT   PCIE_MAX_NUM_TX_DESC
 #define PCIE_MAX_NUM_RX_DESC      256
-#define PCIE_RECEIVE_LIMIT        64
+#define PCIE_RECEIVE_LIMIT        256
 
 enum {
 	IEEE_TYPE_MANAGEMENT = 0,
@@ -100,7 +99,6 @@ enum {
 			     MACREG_A2HRIC_BIT_RADAR_DETECT | \
 			     MACREG_A2HRIC_BIT_CHAN_SWITCH | \
 			     MACREG_A2HRIC_BIT_TX_WATCHDOG | \
-			     MACREG_A2HRIC_BIT_QUE_EMPTY | \
 			     MACREG_A2HRIC_BA_WATCHDOG | \
 			     MACREG_A2HRIC_CONSEC_TXFAIL)
 
@@ -224,7 +222,7 @@ struct pcie_desc_data {
 struct pcie_dma_data {
 	__le16 fwlen;
 	struct ieee80211_hdr wh;
-	char data[0];
+	char data[];
 } __packed;
 
 /* New Data Path */
@@ -458,7 +456,7 @@ struct rx_info { /* HW Rx buffer */
 	__le32 reserved3[6];
 	__le32 param;
 	__le32 reserved4[2];
-	__le32 hdr[0]; /* Len from HW includes rx_info w/ hdr */
+	__le32 hdr[]; /* Len from HW includes rx_info w/ hdr */
 } __packed;
 
 struct pcie_rx_desc_ndp { /* ToNIC Rx Empty Buffer Ring Entry */
@@ -584,8 +582,10 @@ struct pcie_priv {
 	spinlock_t int_mask_lock ____cacheline_aligned_in_smp;
 	struct tasklet_struct tx_task;
 	struct tasklet_struct tx_done_task;
+	/* NAPI */
+	struct net_device napi_dev;
+	struct napi_struct napi;
 	struct tasklet_struct rx_task;
-	struct tasklet_struct qe_task;
 	unsigned int tx_head_room;
 	int txq_limit;
 	int txq_wake_threshold;
@@ -593,16 +593,11 @@ struct pcie_priv {
 	bool is_tx_done_schedule;
 	int recv_limit;
 	bool is_rx_schedule;
-	bool is_qe_schedule;
-	u32 qe_trig_num;
-	unsigned long qe_trig_time;
 
 	/* various descriptor data */
 	/* for tx descriptor data  */
 	spinlock_t tx_desc_lock ____cacheline_aligned_in_smp;
 	struct pcie_desc_data desc_data[PCIE_NUM_OF_DESC_DATA];
-	int delay_q_idx;
-	struct sk_buff *delay_q[PCIE_DELAY_FREE_Q_LIMIT];
 	/* number of descriptors owned by fw at any one time */
 	int fw_desc_cnt[PCIE_NUM_OF_DESC_DATA];
 
@@ -678,7 +673,7 @@ struct acnt_tx_s { /* Accounting Record For Tx (at Enqueue time) */
 	__le32 tx_cnt;        /* No. of pkt sent                              */
 	struct tx_info tx_info;/* Transmit parameters used for 1st MPDU/AMPDU */
 	struct pcie_dma_data hdr;/* Dot11 header used for 1st MPDU in AMPDU   */
-	u8 payload[0];        /* Variable Payload by use case                 */
+	u8 payload[];        /* Variable Payload by use case                 */
 } __packed;
 
 struct acnt_rx_s { /* Accounting Record for Rx PPDU */
@@ -789,8 +784,7 @@ static inline void pcie_tx_add_dma_header(struct mwl_priv *priv,
 
 static inline void pcie_tx_encapsulate_frame(struct mwl_priv *priv,
 					     struct sk_buff *skb,
-					     struct ieee80211_key_conf *k_conf,
-					     bool *ccmp)
+					     struct ieee80211_key_conf *k_conf)
 {
 	int head_pad = 0;
 	int data_pad = 0;
@@ -817,8 +811,6 @@ static inline void pcie_tx_encapsulate_frame(struct mwl_priv *priv,
 			break;
 		case WLAN_CIPHER_SUITE_CCMP:
 			data_pad = 8;
-			if (ccmp)
-				*ccmp = true;
 			break;
 		}
 	}
@@ -998,10 +990,11 @@ static inline void pcie_rx_remove_dma_header(struct sk_buff *skb, __le16 qos)
 	hdrlen = ieee80211_hdrlen(dma_data->wh.frame_control);
 
 	if (hdrlen != sizeof(dma_data->wh)) {
+		/* Adding qos to a nullfunc frame causes problems. */
 		if (ieee80211_is_data_qos(dma_data->wh.frame_control)) {
 			memmove(dma_data->data - hdrlen,
-				&dma_data->wh, hdrlen - 2);
-			*((__le16 *)(dma_data->data - 2)) = qos;
+				&dma_data->wh, hdrlen - IEEE80211_QOS_CTL_LEN);
+			*((__le16 *)(dma_data->data - IEEE80211_QOS_CTL_LEN)) = qos;
 		} else {
 			memmove(dma_data->data - hdrlen, &dma_data->wh, hdrlen);
 		}
